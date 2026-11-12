@@ -290,7 +290,7 @@ void App::openPreviewLink(const MarkdownPreview::Link& link, bool newTab) {
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
     // A folder link shows the folder's README, as GitHub does; otherwise the folder opens in the side bar.
     for (const wchar_t* name : {L"README.md", L"readme.md", L"Readme.md", L"index.md"}) {
-      std::wstring candidate = path + L"\\" + name;
+      std::wstring candidate = path + kPathSepStr + name;
       DWORD ca = GetFileAttributesW(candidate.c_str());
       if (ca != INVALID_FILE_ATTRIBUTES && !(ca & FILE_ATTRIBUTE_DIRECTORY)) {
         path = candidate;
@@ -325,7 +325,7 @@ std::wstring App::noteRootFor(const Document& d) {
   if (!root.empty()) return root;
   for (const auto& folder : tree_.folders())
     if (base.size() >= folder.size() && _wcsnicmp(base.c_str(), folder.c_str(), folder.size()) == 0 &&
-        (base.size() == folder.size() || base[folder.size()] == L'\\'))
+        (base.size() == folder.size() || base[folder.size()] == kPathSep))
       return folder;
   return base;
 }

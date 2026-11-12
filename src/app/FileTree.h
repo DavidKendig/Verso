@@ -75,10 +75,22 @@ class FileIndex {
   std::atomic<bool> ready_{false};
 };
 
+// The path separator: '\' on Windows, '/' on Linux.
+#ifdef _WIN32
+inline constexpr wchar_t kPathSep = L'\\';
+#else
+inline constexpr wchar_t kPathSep = L'/';
+#endif
+inline const std::wstring kPathSepStr(1, kPathSep);
+
 std::wstring fileNameOf(const std::wstring& path);
 std::wstring parentOf(const std::wstring& path);
-// Windows paths compare case-insensitively.
+// Windows paths compare case-insensitively; Linux paths are case-sensitive.
 bool samePath(const std::wstring& a, const std::wstring& b);
+// Whether the first `n` characters of `path` are `prefix`'s (same case rule).
+bool samePathPrefix(const std::wstring& path, const std::wstring& prefix, size_t n);
+// An absolute path ("C:\x", "\\server\x" on Windows; "/x" on Linux).
+bool isAbsolutePath(const std::wstring& path);
 // The absolute, normalized form of `path` (any length), or `path` when it has none.
 std::wstring fullPathOf(const std::wstring& path);
 

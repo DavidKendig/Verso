@@ -1,7 +1,9 @@
 #pragma once
 
 #include <windows.h>
+#ifdef _WIN32
 #include <wincodec.h>
+#endif
 
 #include <cstdint>
 #include <memory>
@@ -69,7 +71,9 @@ class MarkdownImages {
   uint64_t revision_ = 1;
   uint64_t layoutCounter_ = 0;
   Gfx* paint_ = nullptr;
+#ifdef _WIN32
   ComPtr<IWICImagingFactory> wic_;
+#endif
 };
 
 }  // namespace verso

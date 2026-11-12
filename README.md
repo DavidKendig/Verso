@@ -356,27 +356,44 @@ A few more notes:
 - The icons are made from the logo by `tools/make_icon.py`, which needs
   [Pillow](https://python-pillow.org/).
 
-## Mac and Linux
+## Linux and Mac
 
-Verso runs on Windows today. The core of the editor is written in plain C++ so
-it can move to other systems later:
+Verso runs on Windows and on Linux (Wayland). The core of the editor is plain C++,
+shared by both:
 
-| Part | Windows | macOS | Linux |
+| Part | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| Editor core: editing, search, encodings, syntax highlighting, Markdown, the terminal emulator (`src/core`, `src/syntax`, `src/util`) | Yes | Should build; not yet tried on a Mac | Yes, builds and passes all tests with g++ 13 |
-| The app itself: window, drawing, input, git mode, terminal, PDFs, images, AI connection (`src/app`, `merge/`, `src/mcp`) | Yes | Not yet | Not yet |
+| Editor core: editing, search, encodings, syntax highlighting, Markdown, the terminal emulator (`src/core`, `src/syntax`, `src/util`) | Yes | Yes | Should build; not yet tried on a Mac |
+| The app: window, drawing, input, menus, Markdown preview, terminal, PDFs, images, AI connection (`src/app`, `src/mcp`) | Yes | Yes | Not yet |
+| Git mode, the repository window (`merge/src/main_window.cpp` and its views on Windows, `src/app/linux/GitView.cpp` on Linux) | Yes | Yes | Not yet |
 
-On a Mac or Linux, CMake builds the core and runs its tests:
-`cmake -S . -B build && cmake --build build && ctest --test-dir build`.
+### Building on Linux
 
-To bring the full app over, someone would write a new front end on top of the
-same core. It would need to provide:
+The Linux front end lives in `src/app/linux`: a Wayland window (xdg-shell), drawing
+with Cairo and Pango, the terminal on `forkpty`, the AI connection on a Unix socket in
+`$XDG_RUNTIME_DIR` that only your user can reach, images through gdk-pixbuf and
+librsvg, downloads through libcurl, and PDF pages from poppler-utils (`pdfinfo` and
+`pdftoppm`, run as separate programs). The shared code keeps its Windows calls: a small
+stand-in for the Win32 API (`src/app/linux/Win32Compat.h`, with `win32/windows.h` and
+friends) and for DirectWrite text layouts (`DWriteCompat.h`) maps them to POSIX and
+Pango, so both platforms build from the same sources. Git mode is the exception: on
+Windows it is a child window of common controls, so Linux has its own git view
+(`GitView.cpp`, with the panes it draws in `GitWidgets.cpp`) that keeps the same layout,
+commands, menus and git calls, and shares the git library in `merge/src`.
 
-- a window and text drawing (Cocoa and Core Text, GTK with Cairo and Pango, or a
-  cross-platform toolkit);
-- a pseudo terminal (`forkpty`) for the terminal;
-- running git, file dialogs, the clipboard, and a Unix socket in place of the
-  named pipe for AI tools.
+You need a C++20 compiler, CMake, Ninja, and the development files for wayland,
+wayland-protocols, xkbcommon, cairo, pango, fontconfig, glib, gdk-pixbuf, librsvg and
+libcurl. At run time, `git`, `poppler-utils`, and zenity (or ryu-picker) for the Open
+and Save dialogs.
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build && ctest --test-dir build
+sudo cmake --install build   # verso, verso-mcp, the .desktop file, icons and licenses
+```
+
+Settings, keymap and the session are kept in `~/.config/verso`. On a Mac, CMake builds
+the core and runs its tests.
 
 The icons are ready for all three: `res/Verso.ico` for Windows, `res/Verso.icns`
 for a Mac app and `res/icons/verso-<size>.png` (16 to 512 px) for Linux.

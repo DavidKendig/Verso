@@ -5,6 +5,14 @@
 #include <memory>
 #include <string>
 
+#ifndef _WIN32
+namespace verso {
+class Gfx;
+struct Theme;
+struct RectF;
+}  // namespace verso
+#endif
+
 // Notifications from the git view to the application that hosts it.
 struct MergeViewCallbacks {
     // The open repository and branch, as "name (branch)", or "" when none is open.
@@ -28,7 +36,23 @@ public:
     bool busy() const;
 
     // Host integration.
+#ifdef _WIN32
     bool translateAccelerator(MSG* msg);
+#else
+    // Linux: the git view is drawn by Verso inside its own window and gets its input
+    // from the host (the Windows view is a child window that reads its own). Points are
+    // in the coordinates of `paint`'s area. The input calls return false for what the
+    // view leaves to the host: keys it has no use for (menu mnemonics) and the pointer
+    // outside its area (the status bar), unless a drag or one of its dialogs holds it.
+    enum class Pointer { Arrow, IBeam, ResizeH };
+    void paint(verso::Gfx& g, const verso::Theme& theme, const verso::RectF& area);
+    bool keyDown(unsigned vk, bool ctrl, bool shift, bool alt);
+    void charTyped(wchar_t c);
+    bool mouseButton(int button, bool down, float x, float y);
+    bool mouseMove(float x, float y, Pointer* pointer);
+    bool wheel(float notches, bool horizontal, float x, float y);
+    bool modal() const;  // one of the view's dialogs is open
+#endif
     void onMenuCommand(WPARAM wp, LPARAM lp);
     void activate();  // opens the most recent repository if none is open, refreshes, focuses
     void refresh();   // re-reads the repository (after edits or external changes)
