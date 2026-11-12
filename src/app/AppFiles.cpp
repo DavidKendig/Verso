@@ -20,7 +20,12 @@ Document* App::doc() { return active_ < docs_.size() ? docs_[active_].get() : nu
 
 LineEnding App::defaultLineEnding() const {
   if (settings_.defaultLineEnding == L"unix") return LineEnding::LF;
-  return LineEnding::CRLF;
+  if (settings_.defaultLineEnding == L"windows") return LineEnding::CRLF;
+#ifdef _WIN32
+  return LineEnding::CRLF;  // "system"
+#else
+  return LineEnding::LF;
+#endif
 }
 
 Document& App::newDocument(bool activateIt) {
@@ -207,8 +212,8 @@ bool App::saveDocument(Document& d, bool saveAs) {
   }
   addRecent(recentFiles_, path);
   setStatus(L"Saved " + path);
-  if (samePath(path, dataDir() + L"\\Preferences.json")) loadSettings(true);
-  if (samePath(path, dataDir() + L"\\Keymap.json")) {
+  if (samePath(path, dataDir() + kPathSepStr + L"Preferences.json")) loadSettings(true);
+  if (samePath(path, dataDir() + kPathSepStr + L"Keymap.json")) {
     loadKeymap(true);
     buildMenu();
   }
@@ -406,6 +411,7 @@ void App::addRecent(std::vector<std::wstring>& list, const std::wstring& item) {
   if (list.size() > 20) list.resize(20);
 }
 
+#ifdef _WIN32  // Linux: linux/AppLinux.cpp (zenity dialogs, ~/.config/verso)
 std::vector<std::wstring> App::promptOpenFiles() {
   std::vector<std::wstring> out;
   ComPtr<IFileOpenDialog> dlg;
@@ -513,11 +519,12 @@ std::wstring App::dataDir() {
   CreateDirectoryW(dir.c_str(), nullptr);
   return dir;
 }
+#endif  // _WIN32
 
 void App::loadSettings(bool showErrors) {
   Settings s;
   std::wstring err;
-  bool ok = s.load(dataDir() + L"\\Preferences.json", &err);
+  bool ok = s.load(dataDir() + kPathSepStr + L"Preferences.json", &err);
   if (!ok && showErrors) MessageBoxW(hwnd_, err.c_str(), L"Verso", MB_ICONWARNING);
   settings_ = s;
   tree_.rules = {settings_.folderExcludePatterns, settings_.fileExcludePatterns};
@@ -542,7 +549,7 @@ void App::loadSettings(bool showErrors) {
 void App::loadKeymap(bool showErrors) {
   keymap_.loadDefaults();
   std::wstring err;
-  if (!keymap_.loadUserFile(dataDir() + L"\\Keymap.json", &err) && showErrors)
+  if (!keymap_.loadUserFile(dataDir() + kPathSepStr + L"Keymap.json", &err) && showErrors)
     MessageBoxW(hwnd_, err.c_str(), L"Verso", MB_ICONWARNING);
 }
 
@@ -613,7 +620,7 @@ void App::sidebarContextMenu(TreeNode* node, POINT screen) {
     case 1:
       prompt(L"File Name:", L"", [this, base](const std::wstring& name) {
         if (trim(name).empty()) return;
-        std::wstring p = base + L"\\" + std::wstring(trim(name));
+        std::wstring p = base + kPathSepStr + std::wstring(trim(name));
         std::wstring err;
         if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) writeFileAtomic(p, "", &err);
         tree_.refresh();
@@ -623,7 +630,7 @@ void App::sidebarContextMenu(TreeNode* node, POINT screen) {
     case 2:
       prompt(L"Folder Name:", L"", [this, base](const std::wstring& name) {
         if (trim(name).empty()) return;
-        CreateDirectoryW((base + L"\\" + std::wstring(trim(name))).c_str(), nullptr);
+        CreateDirectoryW((base + kPathSepStr + std::wstring(trim(name))).c_str(), nullptr);
         tree_.refresh();
         invalidate();
       });
@@ -631,7 +638,7 @@ void App::sidebarContextMenu(TreeNode* node, POINT screen) {
     case 3:
       prompt(L"New Name:", fileNameOf(path), [this, path](const std::wstring& name) {
         if (trim(name).empty()) return;
-        std::wstring target = parentOf(path) + L"\\" + std::wstring(trim(name));
+        std::wstring target = parentOf(path) + kPathSepStr + std::wstring(trim(name));
         if (!MoveFileExW(path.c_str(), target.c_str(), 0)) {
           setStatus(L"Rename failed: " + lastErrorMessage(GetLastError()));
           return;
@@ -641,7 +648,7 @@ void App::sidebarContextMenu(TreeNode* node, POINT screen) {
             d->path = target;
             d->diskWriteTime = fileWriteTime(target);
           } else if (d->path.size() > path.size() && _wcsnicmp(d->path.c_str(), path.c_str(), path.size()) == 0 &&
-                     d->path[path.size()] == L'\\') {
+                     d->path[path.size()] == kPathSep) {
             d->path = target + d->path.substr(path.size());
           }
         }
@@ -652,7 +659,11 @@ void App::sidebarContextMenu(TreeNode* node, POINT screen) {
       });
       break;
     case 4: {
+#ifdef _WIN32
       std::wstring q = L"Move " + path + L" to the Recycle Bin?";
+#else
+      std::wstring q = L"Move " + path + L" to the Trash?";
+#endif
       if (MessageBoxW(hwnd_, q.c_str(), L"Verso", MB_OKCANCEL | MB_ICONWARNING) != IDOK) break;
       std::wstring from = path + L'\0';
       SHFILEOPSTRUCTW op{};
@@ -719,6 +730,7 @@ void App::saveSession() {
   root.set("markdown_view", static_cast<int>(mdView_));
   root.set("word_wrap", settings_.wordWrap);
 
+#ifdef _WIN32  // on Linux (Wayland) the compositor places windows
   WINDOWPLACEMENT wp{sizeof(wp)};
   if (fullscreen_)
     wp = savedPlacement_;
@@ -731,6 +743,7 @@ void App::saveSession() {
   win.set("h", static_cast<int>(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top));
   win.set("maximized", wp.showCmd == SW_SHOWMAXIMIZED || (wp.flags & WPF_RESTORETOMAXIMIZED) != 0);
   root.set("window", win);
+#endif
 
   auto list = [](const std::vector<std::wstring>& v) {
     json::Value a = json::Value::makeArray();
@@ -772,14 +785,14 @@ void App::saveSession() {
   root.set("docs", docs);
 
   std::wstring err;
-  writeFileAtomic(dataDir() + L"\\Session.json", json::serialize(root, 1), &err);
+  writeFileAtomic(dataDir() + kPathSepStr + L"Session.json", json::serialize(root, 1), &err);
   sessionDirty_ = false;
 }
 
 bool App::restoreSession() {
   if (!ownsSession_) return false;
   std::string bytes;
-  if (!readFileBytes(dataDir() + L"\\Session.json", bytes, nullptr)) return false;
+  if (!readFileBytes(dataDir() + kPathSepStr + L"Session.json", bytes, nullptr)) return false;
   auto v = json::parse(bytes);
   if (!v || !v->isObject()) return false;
 
@@ -865,6 +878,10 @@ bool App::restoreSession() {
   for (size_t i = 0; i < docs_.size(); ++i)
     if (docs_[i].get() == activeDoc) active_ = i;
 
+#ifndef _WIN32
+  computeLayout();
+  return true;  // Wayland: the compositor sizes and places the window
+#else
   if (const auto* w = v->get("window"); w && w->isObject()) {
     WINDOWPLACEMENT wp{sizeof(wp)};
     wp.rcNormalPosition.left = static_cast<LONG>(w->getNumber("x", 100));
@@ -882,6 +899,7 @@ bool App::restoreSession() {
     return true;
   }
   return false;
+#endif
 }
 
 }  // namespace verso

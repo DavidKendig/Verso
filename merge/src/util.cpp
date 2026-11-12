@@ -1,10 +1,11 @@
 #include "util.h"
 
-#include <windows.h>
+#include <windows.h>  // Linux: src/app/linux/win32/windows.h
 
 #include <ctime>
 #include <cwctype>
 
+#ifdef _WIN32
 std::wstring Widen(std::string_view s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -20,6 +21,12 @@ std::string Narrow(std::wstring_view w) {
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
 }
+#else
+#include "core/TextUtil.h"
+std::wstring Widen(std::string_view s) { return verso::utf8ToWide(s); }
+std::string Narrow(std::wstring_view w) { return verso::wideToUtf8(w); }
+#define localtime_s(tmp, tp) localtime_r((tp), (tmp))
+#endif
 
 std::vector<std::string> Split(std::string_view s, char sep) {
     std::vector<std::string> out;
@@ -102,7 +109,11 @@ std::wstring RelativeTime(int64_t unixTime) {
 
 static std::wstring Lower(std::wstring_view s) {
     std::wstring r(s);
+#ifdef _WIN32
     if (!r.empty()) CharLowerBuffW(r.data(), (DWORD)r.size());
+#else
+    for (auto& c : r) c = (wchar_t)towlower(c);
+#endif
     return r;
 }
 
@@ -122,11 +133,25 @@ bool MatchesAllTokens(std::wstring_view haystack, std::wstring_view query) {
 
 std::wstring JoinRepoPath(const std::wstring& root, std::string_view relPath) {
     std::wstring p = root;
+#ifdef _WIN32
     if (!p.empty() && p.back() != L'\\') p.push_back(L'\\');
     for (wchar_t c : Widen(relPath)) p.push_back(c == L'/' ? L'\\' : c);
+#else
+    if (!p.empty() && p.back() != L'/') p.push_back(L'/');
+    p += Widen(relPath);
+#endif
     return p;
 }
 
+#ifndef _WIN32
+namespace verso {
+void setClipboardText(HWND owner, const std::wstring& text);  // src/app/linux/Clipboard.cpp
+}
+bool CopyToClipboard(void* hwnd, const std::wstring& text) {
+    verso::setClipboardText((HWND)hwnd, text);
+    return true;
+}
+#else
 bool CopyToClipboard(void* hwnd, const std::wstring& text) {
     if (!OpenClipboard((HWND)hwnd)) return false;
     EmptyClipboard();
@@ -140,3 +165,4 @@ bool CopyToClipboard(void* hwnd, const std::wstring& text) {
     CloseClipboard();
     return mem != nullptr;
 }
+#endif

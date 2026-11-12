@@ -48,8 +48,9 @@ class GitService {
   void refresh(std::vector<std::wstring> paths);  // folders or files; their repositories are scanned
   void requestBaseline(uint64_t docId, const std::wstring& path);
 
-  // Main thread: picks up finished work. Returns true when anything changed.
-  bool collect(std::vector<GitBaseline>& baselines);
+  // Main thread: picks up finished work. Returns true when anything changed;
+  // `reposChanged` is set when a repository scan finished (baselines alone do not count).
+  bool collect(std::vector<GitBaseline>& baselines, bool* reposChanged = nullptr);
 
   const GitRepoState* repoFor(const std::wstring& path) const;
   GitBadge badgeFor(const std::wstring& path, bool isDir) const;

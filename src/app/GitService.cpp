@@ -20,15 +20,17 @@ bool isDirectory(const std::wstring& p) {
 
 bool underRoot(const std::wstring& k, const std::wstring& rootKey) {
   return k == rootKey || (k.size() > rootKey.size() && k.compare(0, rootKey.size(), rootKey) == 0 &&
-                          (k[rootKey.size()] == L'\\' || rootKey.back() == L'\\'));
+                          (k[rootKey.size()] == kPathSep || rootKey.back() == kPathSep));
 }
 
 }  // namespace
 
 std::wstring GitService::key(const std::wstring& path) {
   std::wstring k = path;
+#ifdef _WIN32  // Windows paths are case-insensitive and may use either slash
   for (auto& c : k) c = c == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(c));
-  while (k.size() > 3 && k.back() == L'\\') k.pop_back();
+#endif
+  while (k.size() > 3 && k.back() == kPathSep) k.pop_back();
   return k;
 }
 
@@ -130,7 +132,7 @@ void GitService::run() {
             std::wstring full = key(JoinRepoPath(st.root, rel));
             if (x == '!') {
               if (!rel.empty() && rel.back() == '/')
-                st.ignoredDirs.push_back(full + L"\\");
+                st.ignoredDirs.push_back(full + kPathSepStr);
               else
                 st.files[full] = GitBadge::Ignored;
               continue;
@@ -190,7 +192,7 @@ GitBaseline GitService::loadBaseline(uint64_t docId, const std::wstring& path) {
   return b;
 }
 
-bool GitService::collect(std::vector<GitBaseline>& baselines) {
+bool GitService::collect(std::vector<GitBaseline>& baselines, bool* reposChanged) {
   std::lock_guard<std::mutex> lock(mu_);
   bool changed = false;
   if (pendingRepos_) {
@@ -198,6 +200,7 @@ bool GitService::collect(std::vector<GitBaseline>& baselines) {
     pendingRepos_.reset();
     changed = true;
   }
+  if (reposChanged) *reposChanged = changed;
   baselines = std::move(pendingBaselines_);
   pendingBaselines_.clear();
   return changed || !baselines.empty();
@@ -219,7 +222,7 @@ GitBadge GitService::badgeFor(const std::wstring& path, bool isDir) const {
   if (!repo) return GitBadge::None;
   std::wstring k = key(path);
   for (const auto& d : repo->ignoredDirs)
-    if (k.size() + 1 >= d.size() && (k + L"\\").compare(0, d.size(), d) == 0) return GitBadge::Ignored;
+    if (k.size() + 1 >= d.size() && (k + kPathSepStr).compare(0, d.size(), d) == 0) return GitBadge::Ignored;
   if (isDir) return repo->changedDirs.count(k) ? GitBadge::Modified : GitBadge::None;
   auto it = repo->files.find(k);
   return it == repo->files.end() ? GitBadge::None : it->second;

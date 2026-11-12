@@ -1,5 +1,12 @@
 #include <windows.h>
 
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -33,6 +40,9 @@ uint32_t paletteRgb(uint8_t i) {
 }
 
 void appendUtf16(std::wstring& out, char32_t c) {
+#ifndef _WIN32
+  out += static_cast<wchar_t>(c);  // wchar_t holds a whole code point on Linux
+#else
   if (c >= 0x10000) {
     c -= 0x10000;
     out += static_cast<wchar_t>(0xD800 + (c >> 10));
@@ -40,14 +50,38 @@ void appendUtf16(std::wstring& out, char32_t c) {
   } else {
     out += static_cast<wchar_t>(c);
   }
+#endif
 }
 
+#ifndef _WIN32
+std::wstring exeDirectory() {
+  char path[4096];
+  ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+  std::string p = n > 0 ? std::string(path, static_cast<size_t>(n)) : std::string("/usr/bin/verso");
+  return utf8ToWide(p.substr(0, p.find_last_of('/')));
+}
+
+// The user's login shell: $SHELL, else the password database, else /bin/sh.
+std::wstring loginShell() {
+  if (const char* s = getenv("SHELL"); s && *s && access(s, X_OK) == 0) return utf8ToWide(s);
+  if (passwd* pw = getpwuid(getuid()); pw && pw->pw_shell && *pw->pw_shell && access(pw->pw_shell, X_OK) == 0)
+    return utf8ToWide(pw->pw_shell);
+  return L"/bin/sh";
+}
+
+std::wstring homeDirectory() {
+  if (const char* h = getenv("HOME"); h && *h) return utf8ToWide(h);
+  if (passwd* pw = getpwuid(getuid()); pw && pw->pw_dir) return utf8ToWide(pw->pw_dir);
+  return L"/";
+}
+#else
 std::wstring exeDirectory() {
   wchar_t path[MAX_PATH * 4];
   DWORD n = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
   std::wstring p(path, n);
   return p.substr(0, p.find_last_of(L'\\'));
 }
+#endif
 
 }  // namespace
 
@@ -77,20 +111,30 @@ void App::setTerminalMode(bool on) {
 
 std::wstring App::terminalShell() const {
   if (!settings_.terminalShell.empty()) return settings_.terminalShell;
+#ifndef _WIN32
+  // Pty runs this through /bin/sh -c "exec ...", so a path with spaces is quoted.
+  std::wstring shell = loginShell();
+  return shell.find(L' ') == std::wstring::npos ? shell : L"'" + shell + L"'";
+#else
   wchar_t found[MAX_PATH];
   if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, found, nullptr)) return L"\"" + std::wstring(found) + L"\" -NoLogo";
   wchar_t sys[MAX_PATH];
   GetSystemDirectoryW(sys, MAX_PATH);
   return L"\"" + std::wstring(sys) + L"\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoLogo";
+#endif
 }
 
 // Where the work is: the first project folder, else the active file's folder, else home.
 std::wstring App::terminalFolder() const {
   if (!tree_.folders().empty()) return tree_.folders().front();
   if (!docs_.empty() && !docs_[active_]->path.empty()) return parentOf(docs_[active_]->path);
+#ifndef _WIN32
+  return homeDirectory();
+#else
   wchar_t home[MAX_PATH];
   DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
   return n > 0 && n < MAX_PATH ? std::wstring(home, n) : std::wstring();
+#endif
 }
 
 void App::selectTerminal() {
@@ -125,7 +169,11 @@ bool App::startTerminal() {
       {L"TERM_PROGRAM", L"Verso"},
       {L"TERM_PROGRAM_VERSION", VERSO_VERSION_WSTRING},
       {L"COLORTERM", L"truecolor"},
+#ifdef _WIN32
       {L"VERSO_MCP_BRIDGE", exeDirectory() + L"\\verso-mcp.exe"},
+#else
+      {L"VERSO_MCP_BRIDGE", exeDirectory() + L"/verso-mcp"},
+#endif
       // Verso sets these for its own background git; an interactive shell needs git's defaults.
       {L"GIT_TERMINAL_PROMPT", L""},
       {L"GIT_OPTIONAL_LOCKS", L""},

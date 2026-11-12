@@ -9,6 +9,12 @@
 
 namespace verso {
 
+#ifndef _WIN32
+namespace linux_fonts {
+extern const char* const kOflText;  // the bundled fonts' license (EmbeddedFonts.cpp)
+}
+#endif
+
 namespace {
 
 constexpr size_t npos = static_cast<size_t>(-1);
@@ -177,7 +183,7 @@ void App::registerCommands() {
     prompt(L"New Name:", fileNameOf(d->path), [this, id](const std::wstring& name) {
       for (auto& dp : docs_) {
         if (dp->id != id || trim(name).empty()) continue;
-        std::wstring target = parentOf(dp->path) + L"\\" + std::wstring(trim(name));
+        std::wstring target = parentOf(dp->path) + kPathSepStr + std::wstring(trim(name));
         if (!MoveFileExW(dp->path.c_str(), target.c_str(), 0)) {
           setStatus(L"Rename failed: " + lastErrorMessage(GetLastError()));
           return;
@@ -511,9 +517,9 @@ void App::registerCommands() {
 
   // Preferences & help -------------------------------------------------------
   addCommand("open_settings", L"Preferences: Settings",
-             [this] { openConfigFile(dataDir() + L"\\Preferences.json", Settings::defaultFileContents()); });
+             [this] { openConfigFile(dataDir() + kPathSepStr + L"Preferences.json", Settings::defaultFileContents()); });
   addCommand("open_keymap", L"Preferences: Key Bindings",
-             [this] { openConfigFile(dataDir() + L"\\Keymap.json", Keymap::defaultFileContents()); });
+             [this] { openConfigFile(dataDir() + kPathSepStr + L"Keymap.json", Keymap::defaultFileContents()); });
   addCommand("key_binding_reference", L"Help: Key Binding Reference",
              [this] { openScratch(keyBindingReference(), languageByName(L"Markdown")); });
   addCommand("third_party_licenses", L"Help: Third-Party Licenses", [this] {
@@ -524,6 +530,7 @@ void App::registerCommands() {
         L"(https://github.com/JetBrains/JetBrainsMono). Bundled as \"JetBrains Mono Slashed\":\n"
         L"modified so the digit zero uses the font's slashed-zero glyph by default, and renamed.\n"
         L"Licensed under the SIL Open Font License, Version 1.1, reproduced below.\n\n"
+#ifdef _WIN32
         L"The C++ standard library is the Microsoft STL (Apache License 2.0 with LLVM Exception),\n"
         L"linked statically with the Microsoft C runtime under the Visual Studio license terms.\n"
         L"Git features run the separately installed git.exe (Git for Windows, GPL v2); it is not\n"
@@ -535,6 +542,15 @@ void App::registerCommands() {
         if (data) text += normalizeNewlines(utf8ToWide(std::string_view(data, SizeofResource(module, res))));
       }
     }
+#else
+        L"On Linux, Verso uses these system libraries, dynamically linked and not part of Verso:\n"
+        L"GNU libstdc++ (GPL v3 with the GCC Runtime Library Exception), Wayland and xkbcommon\n"
+        L"(MIT), Cairo (LGPL 2.1 or MPL 1.1), Pango, GLib/GIO, gdk-pixbuf and librsvg (LGPL 2.1+),\n"
+        L"fontconfig (MIT-style) and libcurl (curl license).\n"
+        L"Git features run the system's git (GPL v2), and PDF pages are drawn by poppler-utils'\n"
+        L"pdfinfo and pdftoppm (GPL), run as separate programs; none of them is included in Verso.\n\n";
+    text += normalizeNewlines(utf8ToWide(linux_fonts::kOflText));
+#endif
     openScratch(text, nullptr);
     if (Document* d = doc()) {
       d->ed.markSaved();
