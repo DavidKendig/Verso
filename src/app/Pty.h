@@ -37,9 +37,14 @@ class Pty {
  private:
   struct Shared;
   std::shared_ptr<Shared> shared_;
+#ifdef _WIN32
   HPCON console_ = nullptr;
   HANDLE input_ = nullptr;  // our end of the program's input pipe
   HANDLE process_ = nullptr;
+#else
+  int master_ = -1;  // the pseudo terminal (linux/Pty.cpp: forkpty)
+  int pid_ = -1;
+#endif
   int cols_ = 0, rows_ = 0;
 };
 

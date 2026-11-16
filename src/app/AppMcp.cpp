@@ -170,9 +170,9 @@ void App::startMcp() {
 
 std::wstring App::mcpResolve(const std::wstring& path) const {
   if (path.empty()) return path;
-  const bool absolute = (path.size() > 1 && path[1] == L':') || path.rfind(L"\\\\", 0) == 0;
+  const bool absolute = isAbsolutePath(path);
   if (absolute) return fullPathOf(path);
-  if (!tree_.folders().empty()) return fullPathOf(tree_.folders().front() + L"\\" + path);
+  if (!tree_.folders().empty()) return fullPathOf(tree_.folders().front() + kPathSepStr + path);
   return fullPathOf(path);
 }
 

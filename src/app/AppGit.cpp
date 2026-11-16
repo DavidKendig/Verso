@@ -31,7 +31,10 @@ void App::requestGitBaseline(Document& d) {
 
 void App::onGitResults() {
   std::vector<GitBaseline> baselines;
-  bool reposChanged = git_.collect(baselines);
+  // Only a finished repository scan reloads the bases: treating an arriving baseline as a
+  // change re-requested every baseline forever, running git several times a second.
+  bool reposChanged = false;
+  git_.collect(baselines, &reposChanged);
   for (auto& b : baselines) {
     for (auto& d : docs_) {
       if (d->id != b.docId || d->path != b.path) continue;

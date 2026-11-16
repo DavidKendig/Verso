@@ -23,6 +23,11 @@
 #include "util/Json.h"
 
 class MergeView;
+#ifndef _WIN32
+namespace verso::platform {
+class Window;
+}
+#endif
 
 namespace verso {
 
@@ -65,6 +70,40 @@ class App {
   void requestClose();
   void applyDarkTitleBar();
   void updateImePosition();
+  // Shared by the Win32 window procedure and the Linux front end.
+  bool onAppMessage(UINT msg, WPARAM wp);  // WM_APP+n posted by background work
+  void onMenuCommand(UINT id);             // a menu item was chosen
+  enum class CursorKind { Arrow, IBeam, SizeWE, Hand };
+  CursorKind cursorAt(float x, float y);   // the mouse cursor over a client point
+
+#ifndef _WIN32
+  // --- linux/AppLinux.cpp: the Linux front end ----------------------------------
+ public:
+  // A message box drawn over the window (MessageBoxW on Linux).
+  int messageBox(const std::wstring& text, const std::wstring& caption, UINT type);
+  static App* current();
+  bool menuBarShown() const { return !fullscreen_; }
+
+ private:
+  struct LinuxUi;
+  std::unique_ptr<platform::Window> window_;
+  std::unique_ptr<LinuxUi> lx_;
+  void linuxPaint(cairo_t* cr, int w, int h);
+  void linuxKeyDown(unsigned vk, bool repeat);
+  void linuxChar(char32_t c);
+  void linuxMouseButton(int button, bool down, float x, float y);
+  void linuxMouseMove(float x, float y);
+  void linuxWheel(float notches, bool horizontal, float x, float y);
+  UINT linuxPopup(HMENU menu, int x, int y, UINT flags);
+  void paintMenuBar();
+  void paintPopups();
+  void paintDialog();
+  bool menuBarMouse(int button, bool down, float x, float y);
+  bool popupMouse(int button, bool down, float x, float y);
+  bool popupKey(unsigned vk);
+  void openMenuBarItem(int index);
+  std::vector<std::wstring> runFileDialog(const std::vector<std::string>& args);
+#endif
 
   // --- AppFiles.cpp: documents, files, session and settings -----------------
   Document* doc();
@@ -345,7 +384,9 @@ class App {
   float sidebarScroll_ = 0;
   bool minimapVisible_ = true;
   bool fullscreen_ = false, distractionFree_ = false;
+#ifdef _WIN32
   WINDOWPLACEMENT savedPlacement_{sizeof(WINDOWPLACEMENT)};
+#endif
   FileTree tree_;
   FileIndex index_;
   GitService git_;

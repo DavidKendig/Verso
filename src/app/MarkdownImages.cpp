@@ -1,8 +1,17 @@
 #include "app/MarkdownImages.h"
 
+#ifdef _WIN32
 #include <d2d1_3.h>
 #include <shlwapi.h>
 #include <winhttp.h>
+#else
+// Linux: libcurl downloads, gdk-pixbuf decodes raster images, librsvg draws SVG
+// (text included, so the DirectWrite text overlay Windows needs is not used).
+#include <cairo.h>
+#include <curl/curl.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <librsvg/rsvg.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -69,6 +78,56 @@ Resolved resolveSource(const std::wstring& raw, const std::wstring& baseDir) {
 
 // --- Loading (worker threads) ------------------------------------------------
 
+#ifndef _WIN32
+size_t curlWrite(char* data, size_t size, size_t n, void* user) {
+  auto* out = static_cast<std::string*>(user);
+  if (out->size() + size * n > kMaxImageBytes) return 0;  // aborts the transfer
+  out->append(data, size * n);
+  return size * n;
+}
+
+bool fetchHttp(const std::wstring& url, std::string& out, std::wstring& err) {
+  static const bool initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+  CURL* c = initialized ? curl_easy_init() : nullptr;
+  if (!c) {
+    err = L"Downloading is unavailable.";
+    return false;
+  }
+  const std::string u = wideToUtf8(url);
+  curl_easy_setopt(c, CURLOPT_URL, u.c_str());
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+  curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+  curl_easy_setopt(c, CURLOPT_USERAGENT, "Verso/1.0");
+  curl_slist* headers = curl_slist_append(nullptr, "Accept: image/*, */*");
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWrite);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+  CURLcode rc = curl_easy_perform(c);
+  long status = 0;
+  curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(c);
+  if (rc == CURLE_WRITE_ERROR) {  // curlWrite refuses data only past the size limit
+    err = L"The image is larger than 32 MB.";
+    return false;
+  }
+  if (rc != CURLE_OK) {
+    err = L"Download failed: " + utf8ToWide(curl_easy_strerror(rc)) + L".";
+    return false;
+  }
+  if (status != 200) {
+    err = L"Download failed: the server answered HTTP " + std::to_wstring(status) + L".";
+    return false;
+  }
+  return true;
+}
+#else
 std::wstring winhttpError(DWORD code) {
   switch (code) {
     case ERROR_WINHTTP_TIMEOUT: return L"the request timed out";
@@ -152,6 +211,7 @@ bool fetchHttp(const std::wstring& url, std::string& out, std::wstring& err) {
   }
   return true;
 }
+#endif
 
 bool base64Decode(std::string_view in, std::string& out) {
   auto value = [](char c) -> int {
@@ -227,6 +287,104 @@ bool looksLikeSvg(const std::string& b) {
 
 // --- SVG facts (parsed off the UI thread) -------------------------------------
 
+#ifndef _WIN32
+struct SvgFacts {};  // librsvg draws everything, text included
+
+GBytes* bytesOf(const std::string& b) { return g_bytes_new_static(b.data(), b.size()); }
+
+// A parsed SVG; null with `err` set when librsvg rejects the data.
+RsvgHandle* openSvg(const std::string& bytes, std::wstring* err) {
+  GBytes* data = bytesOf(bytes);
+  GInputStream* in = g_memory_input_stream_new_from_bytes(data);
+  GError* e = nullptr;
+  RsvgHandle* h = rsvg_handle_new_from_stream_sync(in, nullptr, RSVG_HANDLE_FLAGS_NONE, nullptr, &e);
+  g_object_unref(in);
+  g_bytes_unref(data);
+  if (!h) {
+    if (err) *err = L"The SVG could not be read" + (e ? L": " + utf8ToWide(e->message) : std::wstring()) + L".";
+    if (e) g_error_free(e);
+    return nullptr;
+  }
+  rsvg_handle_set_dpi(h, 96);
+  return h;
+}
+
+// The SVG's size in CSS px: width/height when given, else the viewBox, else 300x150.
+bool svgSize(const std::string& bytes, float& w, float& h, std::wstring& err) {
+  RsvgHandle* svg = openSvg(bytes, &err);
+  if (!svg) return false;
+  double pw = 0, ph = 0;
+  gboolean hasW = FALSE, hasH = FALSE, hasVb = FALSE;
+  RsvgLength lw{}, lh{};
+  RsvgRectangle vb{};
+  rsvg_handle_get_intrinsic_dimensions(svg, &hasW, &lw, &hasH, &lh, &hasVb, &vb);
+  if (rsvg_handle_get_intrinsic_size_in_pixels(svg, &pw, &ph) && pw > 0 && ph > 0) {
+    w = static_cast<float>(pw);
+    h = static_cast<float>(ph);
+  } else if (hasVb && vb.width > 0 && vb.height > 0) {
+    w = static_cast<float>(vb.width);
+    h = static_cast<float>(vb.height);
+  } else {
+    w = 300;
+    h = 150;
+  }
+  g_object_unref(svg);
+  return true;
+}
+
+// Decodes a raster image to premultiplied ARGB32 (cairo's format), at most
+// kMaxDecodeSide pixels per side.
+bool decodeRaster(const std::string& bytes, std::vector<uint8_t>& px, int& pw, int& ph, float& w, float& h,
+                  std::wstring& err) {
+  GdkPixbufLoader* loader = gdk_pixbuf_loader_new();
+  GError* e = nullptr;
+  bool ok = gdk_pixbuf_loader_write(loader, reinterpret_cast<const guchar*>(bytes.data()), bytes.size(), &e) &&
+            gdk_pixbuf_loader_close(loader, &e);
+  GdkPixbuf* pb = ok ? gdk_pixbuf_loader_get_pixbuf(loader) : nullptr;
+  if (!pb) {
+    if (!ok) gdk_pixbuf_loader_close(loader, nullptr);
+    if (e) g_error_free(e);
+    g_object_unref(loader);
+    err = L"The data is not an image format Verso can decode.";
+    return false;
+  }
+  g_object_ref(pb);
+  g_object_unref(loader);
+  if (GdkPixbuf* oriented = gdk_pixbuf_apply_embedded_orientation(pb)) {
+    g_object_unref(pb);
+    pb = oriented;
+  }
+  int fw = gdk_pixbuf_get_width(pb), fh = gdk_pixbuf_get_height(pb);
+  w = static_cast<float>(fw);
+  h = static_cast<float>(fh);
+  if (fw > static_cast<int>(kMaxDecodeSide) || fh > static_cast<int>(kMaxDecodeSide)) {
+    double s = std::min(static_cast<double>(kMaxDecodeSide) / fw, static_cast<double>(kMaxDecodeSide) / fh);
+    GdkPixbuf* scaled = gdk_pixbuf_scale_simple(pb, std::max(1, static_cast<int>(fw * s)),
+                                                std::max(1, static_cast<int>(fh * s)), GDK_INTERP_HYPER);
+    if (scaled) {
+      g_object_unref(pb);
+      pb = scaled;
+    }
+  }
+  pw = gdk_pixbuf_get_width(pb);
+  ph = gdk_pixbuf_get_height(pb);
+  const int n = gdk_pixbuf_get_n_channels(pb), stride = gdk_pixbuf_get_rowstride(pb);
+  const bool alpha = gdk_pixbuf_get_has_alpha(pb);
+  const guchar* src = gdk_pixbuf_read_pixels(pb);
+  px.resize(static_cast<size_t>(pw) * ph * 4);
+  for (int y = 0; y < ph; ++y) {
+    const guchar* s = src + static_cast<size_t>(y) * stride;
+    uint32_t* d = reinterpret_cast<uint32_t*>(px.data() + static_cast<size_t>(y) * pw * 4);
+    for (int x = 0; x < pw; ++x, s += n) {
+      uint32_t a = alpha ? s[3] : 255;
+      uint32_t r = s[0] * a / 255, g = s[1] * a / 255, b = s[2] * a / 255;
+      d[x] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+  }
+  g_object_unref(pb);
+  return true;
+}
+#else
 struct SvgText {
   float x = 0, y = 0;
   std::wstring text;
@@ -636,6 +794,7 @@ bool rasterSize(IWICImagingFactory* wic, const std::string& bytes, float& w, flo
   h = static_cast<float>(fh);
   return true;
 }
+#endif
 
 struct Job {
   std::wstring key;
@@ -651,8 +810,32 @@ struct Loaded {
   float w = 0, h = 0;
   SvgFacts facts;
   uint64_t fileTime = 0;
+#ifndef _WIN32
+  std::vector<uint8_t> pixels;  // decoded raster image (premultiplied ARGB32)
+  int pw = 0, ph = 0;
+#endif
 };
 
+#ifndef _WIN32
+Loaded load(const Job& job) {
+  Loaded r;
+  r.key = job.key;
+  std::string bytes;
+  bool ok = false;
+  switch (job.kind) {
+    case SourceKind::File: ok = readLocal(job.key, bytes, r.error, r.fileTime); break;
+    case SourceKind::Remote: ok = fetchHttp(job.key, bytes, r.error); break;
+    case SourceKind::Data: ok = decodeDataUri(job.key, bytes, r.error); break;
+  }
+  if (ok) {
+    r.svg = looksLikeSvg(bytes);
+    ok = r.svg ? svgSize(bytes, r.w, r.h, r.error) : decodeRaster(bytes, r.pixels, r.pw, r.ph, r.w, r.h, r.error);
+  }
+  r.ok = ok && r.w > 0 && r.h > 0;
+  if (r.ok && r.svg) r.bytes = std::move(bytes);
+  return r;
+}
+#else
 Loaded load(const Job& job, IWICImagingFactory* wic) {
   Loaded r;
   r.key = job.key;
@@ -671,6 +854,7 @@ Loaded load(const Job& job, IWICImagingFactory* wic) {
   if (r.ok) r.bytes = std::move(bytes);
   return r;
 }
+#endif
 
 }  // namespace
 
@@ -687,9 +871,11 @@ struct MarkdownImages::Shared {
   int threads = 0;
 
   static void worker(std::shared_ptr<Shared> self) {
+#ifdef _WIN32
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ComPtr<IWICImagingFactory> wic;
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.GetAddressOf()));
+#endif
     for (;;) {
       Job job;
       {
@@ -699,7 +885,11 @@ struct MarkdownImages::Shared {
         job = std::move(self->jobs.front());
         self->jobs.pop_front();
       }
+#ifdef _WIN32
       Loaded r = load(job, wic.Get());
+#else
+      Loaded r = load(job);
+#endif
       HWND hwnd;
       UINT message;
       {
@@ -711,8 +901,10 @@ struct MarkdownImages::Shared {
       }
       if (hwnd) PostMessageW(hwnd, message, 0, 0);
     }
+#ifdef _WIN32
     wic.Reset();
     if (SUCCEEDED(co)) CoUninitialize();
+#endif
   }
 };
 
@@ -729,9 +921,26 @@ struct MarkdownImages::Entry {
   float w = 0, h = 0;
   SvgFacts facts;
 
-  // Device resources for one render target generation.
   uint64_t generation = UINT64_MAX;
   bool deviceFailed = false;
+#ifndef _WIN32
+  std::vector<uint8_t> pixels;  // raster image, premultiplied ARGB32
+  int pw = 0, ph = 0;
+  cairo_surface_t* surface = nullptr;  // over `pixels`
+  RsvgHandle* svgDoc = nullptr;
+  void reset() {
+    if (surface) cairo_surface_destroy(surface);
+    if (svgDoc) g_object_unref(svgDoc);
+    surface = nullptr;
+    svgDoc = nullptr;
+    deviceFailed = false;
+  }
+  Entry() = default;
+  Entry(const Entry&) = delete;
+  Entry& operator=(const Entry&) = delete;
+  ~Entry() { reset(); }
+#else
+  // Device resources for one render target generation.
   ComPtr<ID2D1Bitmap> bitmap;
   ComPtr<ID2D1SvgDocument> svgDoc;
   struct TextRun {
@@ -742,6 +951,7 @@ struct MarkdownImages::Entry {
   };
   std::vector<TextRun> textRuns;
   bool textBuilt = false;
+#endif
 };
 
 MarkdownImages::MarkdownImages() : shared_(std::make_shared<Shared>()) {}
@@ -861,14 +1071,23 @@ bool MarkdownImages::takeResults() {
       e.w = r.w;
       e.h = r.h;
       e.facts = std::move(r.facts);
+#ifndef _WIN32
+      e.pixels = std::move(r.pixels);
+      e.pw = r.pw;
+      e.ph = r.ph;
+#endif
     } else {
       e.state = State::Failed;
       e.error = r.error;
       e.bytes.clear();
     }
+#ifdef _WIN32
     e.generation = UINT64_MAX;  // rebuild device resources
     e.textRuns.clear();
     e.textBuilt = false;
+#else
+    e.reset();
+#endif
     changed = true;
   }
   if (changed) ++revision_;
@@ -886,18 +1105,65 @@ void MarkdownImages::draw(const std::wstring& key, const RectF& r) {
     return;
   }
   Entry& e = *it->second;
+#ifdef _WIN32
   if (e.generation != g.targetGeneration()) {
     e.bitmap.Reset();
     e.svgDoc.Reset();
     e.deviceFailed = false;
     e.generation = g.targetGeneration();
   }
+#endif
   if (e.svg)
     drawSvg(g, e, r);
   else
     drawRaster(g, e, r);
 }
 
+#ifndef _WIN32
+void MarkdownImages::drawRaster(Gfx& g, Entry& e, const RectF& r) {
+  if (!e.surface && !e.deviceFailed && e.pw > 0 && e.ph > 0) {
+    e.surface = cairo_image_surface_create_for_data(e.pixels.data(), CAIRO_FORMAT_ARGB32, e.pw, e.ph, e.pw * 4);
+    if (cairo_surface_status(e.surface) != CAIRO_STATUS_SUCCESS) {
+      cairo_surface_destroy(e.surface);
+      e.surface = nullptr;
+      e.deviceFailed = true;
+    }
+  }
+  cairo_t* cr = g.cairo();
+  if (!e.surface || !cr || r.w() <= 0 || r.h() <= 0) {
+    g.strokeRounded(r, 3, Color::hex(0x808080, 0.5f), 1);
+    return;
+  }
+  cairo_save(cr);
+  cairo_rectangle(cr, r.l, r.t, r.w(), r.h());
+  cairo_clip(cr);
+  cairo_translate(cr, r.l, r.t);
+  cairo_scale(cr, r.w() / e.pw, r.h() / e.ph);
+  cairo_set_source_surface(cr, e.surface, 0, 0);
+  cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+  cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_PAD);
+  cairo_paint(cr);
+  cairo_restore(cr);
+}
+
+void MarkdownImages::drawSvg(Gfx& g, Entry& e, const RectF& r) {
+  if (!e.svgDoc && !e.deviceFailed) {
+    e.svgDoc = openSvg(e.bytes, nullptr);
+    if (!e.svgDoc) e.deviceFailed = true;
+  }
+  cairo_t* cr = g.cairo();
+  if (!e.svgDoc || !cr) {
+    g.strokeRounded(r, 3, Color::hex(0x808080, 0.5f), 1);
+    return;
+  }
+  cairo_save(cr);
+  cairo_rectangle(cr, r.l, r.t, r.w(), r.h());
+  cairo_clip(cr);
+  RsvgRectangle viewport{r.l, r.t, r.w(), r.h()};
+  rsvg_handle_render_document(e.svgDoc, cr, &viewport, nullptr);
+  cairo_restore(cr);
+}
+#else
 void MarkdownImages::drawRaster(Gfx& g, Entry& e, const RectF& r) {
   ID2D1RenderTarget* rt = g.target();
   if (!e.bitmap && !e.deviceFailed) {
@@ -987,5 +1253,6 @@ void MarkdownImages::drawSvg(Gfx& g, Entry& e, const RectF& r) {
   dc->SetTransform(saved);
   g.popClip();
 }
+#endif
 
 }  // namespace verso

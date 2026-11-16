@@ -6,6 +6,25 @@
 
 #include "util.h"
 
+#ifndef _WIN32
+#include <unistd.h>
+
+#include <cstdlib>
+#define _atoi64(s) strtoll((s), nullptr, 10)
+static const wchar_t kSep[] = L"/";
+
+std::wstring Git::Locate() {
+    const char* path = getenv("PATH");
+    std::string dirs = path && *path ? path : "/usr/local/bin:/usr/bin:/bin";
+    for (const std::string& d : Split(dirs, ':')) {
+        std::string p = (d.empty() ? std::string(".") : d) + "/git";
+        if (access(p.c_str(), X_OK) == 0) return Widen(p);
+    }
+    return {};
+}
+#else
+static const wchar_t kSep[] = L"\\";
+
 std::wstring Git::Locate() {
     wchar_t buf[MAX_PATH];
     if (SearchPathW(nullptr, L"git.exe", nullptr, MAX_PATH, buf, nullptr)) return buf;
@@ -20,6 +39,7 @@ std::wstring Git::Locate() {
     }
     return {};
 }
+#endif
 
 ProcResult Git::Run(const std::vector<std::wstring>& args, const std::string* input, bool log) const {
     std::vector<std::wstring> full = {L"-c", L"core.quotepath=false", L"-c", L"color.ui=false"};
@@ -51,8 +71,10 @@ bool Git::Open(const std::wstring& path, std::wstring& error) {
     }
     auto fix = [](std::string s) {
         std::wstring w = Widen(Trim(s));
+#ifdef _WIN32
         for (auto& c : w)
             if (c == L'/') c = L'\\';
+#endif
         return w;
     };
     root = fix(lines[0]);
@@ -221,7 +243,7 @@ std::string Git::HeadHash() const {
 
 std::wstring Git::OperationState() const {
     auto exists = [&](const wchar_t* name) {
-        return GetFileAttributesW((gitDir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES;
+        return GetFileAttributesW((gitDir + kSep + name).c_str()) != INVALID_FILE_ATTRIBUTES;
     };
     if (exists(L"rebase-merge") || exists(L"rebase-apply")) return L"REBASING";
     if (exists(L"MERGE_HEAD")) return L"MERGING";
@@ -284,7 +306,11 @@ std::string Git::WorkingDiff(const std::vector<std::string>& paths, bool cached)
 // Builds a "new file" patch for an untracked file so it can be shown (and even
 // partially staged with `git apply --cached`) like any other change.
 std::string Git::NewFileDiff(const std::string& path) const {
+#ifdef _WIN32
     std::ifstream in(FullPath(path), std::ios::binary);
+#else
+    std::ifstream in(Narrow(FullPath(path)), std::ios::binary);
+#endif
     std::string data;
     if (in) {
         in.seekg(0, std::ios::end);

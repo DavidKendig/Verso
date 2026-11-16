@@ -12,7 +12,21 @@ std::wstring fileNameOf(const std::wstring& path) {
   return s == std::wstring::npos ? path : path.substr(s + 1);
 }
 
+#ifdef _WIN32
 bool samePath(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) == 0; }
+bool samePathPrefix(const std::wstring& path, const std::wstring& prefix, size_t n) {
+  return _wcsnicmp(path.c_str(), prefix.c_str(), n) == 0;
+}
+bool isAbsolutePath(const std::wstring& path) {
+  return (path.size() > 1 && path[1] == L':') || path.rfind(L"\\\\", 0) == 0;
+}
+#else
+bool samePath(const std::wstring& a, const std::wstring& b) { return a == b; }
+bool samePathPrefix(const std::wstring& path, const std::wstring& prefix, size_t n) {
+  return path.compare(0, n, prefix, 0, n) == 0;
+}
+bool isAbsolutePath(const std::wstring& path) { return !path.empty() && path[0] == L'/'; }
+#endif
 
 std::wstring fullPathOf(const std::wstring& path) {
   DWORD n = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
@@ -45,7 +59,7 @@ struct DirEntry {
 std::vector<DirEntry> listDir(const std::wstring& path, const ExcludeRules& rules) {
   std::vector<DirEntry> out;
   WIN32_FIND_DATAW fd;
-  HANDLE h = FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+  HANDLE h = FindFirstFileExW((path + kPathSepStr + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
                               FIND_FIRST_EX_LARGE_FETCH);
   if (h == INVALID_HANDLE_VALUE) return out;
   do {
@@ -65,7 +79,11 @@ std::vector<DirEntry> listDir(const std::wstring& path, const ExcludeRules& rule
 }
 
 std::wstring normalizeFolder(std::wstring f) {
+#ifdef _WIN32
   while (f.size() > 3 && (f.back() == L'\\' || f.back() == L'/')) f.pop_back();
+#else
+  while (f.size() > 1 && f.back() == L'/') f.pop_back();
+#endif
   return f;
 }
 
@@ -79,7 +97,7 @@ void FileTree::setFolders(const std::vector<std::wstring>& folders) {
 void FileTree::addFolder(const std::wstring& folder) {
   std::wstring f = normalizeFolder(folder);
   for (const auto& r : roots_)
-    if (_wcsicmp(r->path.c_str(), f.c_str()) == 0) return;
+    if (samePath(r->path, f)) return;
   auto n = std::make_unique<TreeNode>();
   n->name = fileNameOf(f).empty() ? f : fileNameOf(f);
   n->path = f;
@@ -91,7 +109,7 @@ void FileTree::addFolder(const std::wstring& folder) {
 
 void FileTree::removeFolder(const std::wstring& folder) {
   roots_.erase(std::remove_if(roots_.begin(), roots_.end(),
-                              [&](const auto& r) { return _wcsicmp(r->path.c_str(), folder.c_str()) == 0; }),
+                              [&](const auto& r) { return samePath(r->path, folder); }),
                roots_.end());
 }
 
@@ -106,7 +124,7 @@ void FileTree::load(TreeNode& n) {
   for (const auto& e : listDir(n.path, rules)) {
     auto c = std::make_unique<TreeNode>();
     c->name = e.name;
-    c->path = n.path + L"\\" + e.name;
+    c->path = n.path + kPathSepStr + e.name;
     c->dir = e.dir;
     c->parent = &n;
     n.children.push_back(std::move(c));
@@ -157,7 +175,7 @@ void FileTree::toggle(TreeNode* n) {
 
 TreeNode* FileTree::find(const std::wstring& path) const {
   std::function<TreeNode*(TreeNode*)> walk = [&](TreeNode* n) -> TreeNode* {
-    if (_wcsicmp(n->path.c_str(), path.c_str()) == 0) return n;
+    if (samePath(n->path, path)) return n;
     for (auto& c : n->children)
       if (TreeNode* f = walk(c.get())) return f;
     return nullptr;
@@ -170,18 +188,18 @@ TreeNode* FileTree::find(const std::wstring& path) const {
 void FileTree::reveal(const std::wstring& path) {
   for (const auto& r : roots_) {
     size_t n = r->path.size();
-    if (path.size() <= n || _wcsnicmp(path.c_str(), r->path.c_str(), n) != 0 || path[n] != L'\\') continue;
+    if (path.size() <= n || !samePathPrefix(path, r->path, n) || path[n] != kPathSep) continue;
     TreeNode* cur = r.get();
     cur->expanded = true;
     size_t pos = n + 1;
     while (cur) {
-      size_t next = path.find(L'\\', pos);
+      size_t next = path.find(kPathSep, pos);
       if (next == std::wstring::npos) return;
       std::wstring part = path.substr(pos, next - pos);
       TreeNode* child = nullptr;
       if (!cur->loaded) load(*cur);
       for (auto& c : cur->children)
-        if (c->dir && _wcsicmp(c->name.c_str(), part.c_str()) == 0) child = c.get();
+        if (c->dir && samePath(c->name, part)) child = c.get();
       if (!child) return;
       child->expanded = true;
       if (!child->loaded) load(*child);
@@ -210,7 +228,7 @@ void FileIndex::start(const std::vector<std::wstring>& roots, const ExcludeRules
         stack.pop_back();
         auto entries = listDir(dir, rules);
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
-          std::wstring full = dir + L"\\" + it->name;
+          std::wstring full = dir + kPathSepStr + it->name;
           std::wstring display = rel + L"/" + it->name;
           if (it->dir)
             stack.emplace_back(full, display);

@@ -1,6 +1,21 @@
 #include "app/McpServer.h"
 
+#ifdef _WIN32
 #include <sddl.h>
+#else
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+
+#include "core/TextUtil.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -17,11 +32,12 @@ namespace verso {
 
 namespace {
 
-constexpr DWORD kBufferSize = 64 * 1024;
+constexpr size_t kBufferSize = 64 * 1024;
 constexpr size_t kMaxMessage = 32u << 20;               // one JSON-RPC message
 constexpr auto kCallTimeout = std::chrono::minutes(2);  // a tool call the UI never ran
 const char* const kProtocolVersions[] = {"2025-06-18", "2025-03-26", "2024-11-05"};
 
+#ifdef _WIN32
 // A security descriptor granting access to the current user (and SYSTEM) only.
 PSECURITY_DESCRIPTOR userOnlyDescriptor() {
   HANDLE token = nullptr;
@@ -63,6 +79,29 @@ struct Overlapped {
     return GetOverlappedResult(h, &ov, &bytes, FALSE) != FALSE;
   }
 };
+#else
+// The folder for the socket: $XDG_RUNTIME_DIR (the user's own 0700 folder), else a
+// private folder in /tmp. Empty when neither is usable.
+std::string socketDir() {
+  if (const char* x = getenv("XDG_RUNTIME_DIR"); x && *x) return x;
+  std::string dir = "/tmp/verso-" + std::to_string(getuid());
+  mkdir(dir.c_str(), 0700);
+  struct stat st {};
+  if (lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077)) return {};
+  return dir;
+}
+
+// Waits until `fd` is ready for `events`; false when `stopFd` fired or polling failed.
+bool waitFor(int fd, short events, int stopFd) {
+  for (;;) {
+    pollfd p[2] = {{fd, events, 0}, {stopFd, POLLIN, 0}};
+    int n = poll(p, 2, -1);
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 || (p[1].revents & POLLIN)) return false;
+    if (p[0].revents) return true;
+  }
+}
+#endif
 
 json::Value rpcResult(const json::Value& id, json::Value result) {
   json::Value r = json::Value::makeObject();
@@ -97,15 +136,23 @@ struct McpServer::Shared {
   std::condition_variable cv;
   std::deque<std::shared_ptr<Call>> queue;
   std::atomic<bool> stopping{false};
+#ifdef _WIN32
   HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // ends every wait in the server
+#else
+  int stopFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);  // readable once stop() runs
+  std::string path;                                     // the socket file, removed on stop
+#endif
   std::atomic<HWND> notify{nullptr};
   UINT message = 0;
   json::Value tools;
   std::string instructions;
   std::wstring name;
+#ifdef _WIN32
   PSECURITY_DESCRIPTOR sd = nullptr;
+#endif
   std::atomic<int> clientCount{0};
 
+#ifdef _WIN32
   ~Shared() {
     if (sd) LocalFree(sd);
     if (stopEvent) CloseHandle(stopEvent);
@@ -118,6 +165,11 @@ struct McpServer::Shared {
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                             PIPE_UNLIMITED_INSTANCES, kBufferSize, kBufferSize, 0, &sa);
   }
+#else
+  ~Shared() {
+    if (stopFd >= 0) close(stopFd);
+  }
+#endif
 
   // A tools/call: queued for the UI thread, which fills in the result.
   json::Value callTool(const std::string& tool, const json::Value& args) {
@@ -186,6 +238,7 @@ struct McpServer::Shared {
     return json::serialize(rpcError(id, -32601, "Method not found: " + method), 0);
   }
 
+#ifdef _WIN32
   static void serve(std::shared_ptr<Shared> self, HANDLE pipe) {
     ++self->clientCount;
     std::string buf;
@@ -244,6 +297,61 @@ struct McpServer::Shared {
       pipe = nullptr;
     }
   }
+#else
+  static void serve(std::shared_ptr<Shared> self, int fd) {
+    ++self->clientCount;
+    std::string buf;
+    std::vector<char> chunk(kBufferSize);
+    for (;;) {
+      if (!waitFor(fd, POLLIN, self->stopFd)) break;
+      ssize_t got = recv(fd, chunk.data(), chunk.size(), 0);
+      if (got < 0 && errno == EINTR) continue;
+      if (got <= 0) break;
+      buf.append(chunk.data(), static_cast<size_t>(got));
+      bool ok = true;
+      size_t nl;
+      while (ok && (nl = buf.find('\n')) != std::string::npos) {
+        std::string line = buf.substr(0, nl);
+        buf.erase(0, nl + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.find_first_not_of(" \t") == std::string::npos) continue;
+        std::string reply = self->handle(line);
+        if (reply.empty()) continue;
+        reply += '\n';
+        for (size_t off = 0; ok && off < reply.size();) {
+          ssize_t n = send(fd, reply.data() + off, reply.size() - off, MSG_NOSIGNAL);
+          if (n > 0)
+            off += static_cast<size_t>(n);
+          else if (n < 0 && errno == EINTR)
+            continue;
+          else
+            ok = false;
+        }
+      }
+      if (!ok || buf.size() > kMaxMessage) break;  // a closed client, or a message without an end
+    }
+    close(fd);
+    --self->clientCount;
+  }
+
+  static void listen(std::shared_ptr<Shared> self, int listenFd) {
+    while (!self->stopping) {
+      if (!waitFor(listenFd, POLLIN, self->stopFd)) break;
+      int fd = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+      if (fd < 0) continue;
+      // Only the user running Verso may drive it (the socket's folder is private too).
+      ucred cred{};
+      socklen_t len = sizeof cred;
+      if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != getuid()) {
+        close(fd);
+        continue;
+      }
+      std::thread(&Shared::serve, self, fd).detach();
+    }
+    close(listenFd);
+    unlink(self->path.c_str());
+  }
+#endif
 };
 
 McpServer::McpServer() = default;
@@ -258,6 +366,7 @@ bool McpServer::start(HWND notify, UINT message, json::Value tools, const std::s
   shared->message = message;
   shared->tools = std::move(tools);
   shared->instructions = instructions;
+#ifdef _WIN32
   shared->sd = userOnlyDescriptor();
   if (!shared->sd || !shared->stopEvent) {
     if (error) *error = L"Could not restrict the MCP pipe to the current user.";
@@ -273,6 +382,36 @@ bool McpServer::start(HWND notify, UINT message, json::Value tools, const std::s
   pipeName_ = shared->name;
   std::thread(&Shared::listen, shared, first).detach();
   return true;
+#else
+  const std::string dir = socketDir();
+  if (dir.empty() || shared->stopFd < 0) {
+    if (error) *error = L"Could not find a private folder for the MCP socket.";
+    return false;
+  }
+  shared->path = dir + "/verso-mcp-" + std::to_string(getpid()) + ".sock";
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  if (shared->path.size() >= sizeof addr.sun_path) {
+    if (error) *error = L"The MCP socket path is too long.";
+    return false;
+  }
+  memcpy(addr.sun_path, shared->path.c_str(), shared->path.size() + 1);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  unlink(shared->path.c_str());  // left by an earlier process that had this pid
+  const mode_t oldMask = umask(077);
+  const bool bound = fd >= 0 && bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
+  umask(oldMask);
+  if (!bound || ::listen(fd, 8) != 0) {
+    if (fd >= 0) close(fd);
+    if (error) *error = L"Could not create the MCP socket " + utf8ToWide(shared->path) + L".";
+    return false;
+  }
+  shared->name = utf8ToWide(shared->path);
+  shared_ = shared;
+  pipeName_ = shared->name;
+  std::thread(&Shared::listen, shared, fd).detach();
+  return true;
+#endif
 }
 
 void McpServer::stop() {
@@ -285,7 +424,14 @@ void McpServer::stop() {
     std::lock_guard<std::mutex> l(shared->m);
     shared->stopping = true;
   }
+#ifdef _WIN32
   SetEvent(shared->stopEvent);  // ends the listener's and every connection's wait
+#else
+  const uint64_t one = 1;
+  if (write(shared->stopFd, &one, sizeof one) < 0) {
+    // The eventfd cannot overflow on a single write; nothing else to do.
+  }
+#endif
   shared->cv.notify_all();
 }
 

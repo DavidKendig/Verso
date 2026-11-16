@@ -60,7 +60,7 @@ add_test(NAME editor_core COMMAND verso_tests)
 # The application front end (window, rendering, input, git mode, terminal, PDF and
 # image views) uses Win32, Direct2D/DirectWrite, WIC, ConPTY and WinHTTP. A macOS or
 # Linux front end would sit on the same portable core; see README > Platforms.
-option(VERSO_BUILD_APP "Build the Verso application (Windows)" ON)
+option(VERSO_BUILD_APP "Build the Verso application (Windows, Linux)" ON)
 
 if(WIN32)
   # --- Git layer: process runner, git wrapper, helpers ---------------------------------
@@ -151,9 +151,129 @@ if(WIN32)
     install(FILES res/fonts/OFL.txt DESTINATION licenses RENAME JetBrainsMono-OFL.txt)
     set(CPACK_GENERATOR ZIP)
   endif()
+elseif(UNIX AND NOT APPLE AND VERSO_BUILD_APP)
+  # --- Linux front end (Wayland + Cairo/Pango) ---------------------------------------------
+  # The app sources are shared with Windows. src/app/linux/ provides the window, drawing,
+  # terminal, AI connection, images and PDF pages, plus the small part of the Win32 API the
+  # shared code calls (Win32Compat), so the Windows code paths stay as they are.
+  find_package(PkgConfig REQUIRED)
+  find_package(Threads REQUIRED)
+  pkg_check_modules(VERSO_LINUX REQUIRED IMPORTED_TARGET
+    wayland-client xkbcommon cairo pangocairo fontconfig gio-2.0 gdk-pixbuf-2.0 librsvg-2.0 libcurl)
+  pkg_get_variable(WAYLAND_PROTOCOLS wayland-protocols pkgdatadir)
+  pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
+  set(_proto_dir ${CMAKE_BINARY_DIR}/protocols)
+  file(MAKE_DIRECTORY ${_proto_dir})
+  set(_proto_srcs)
+  foreach(_spec
+      "stable/xdg-shell/xdg-shell.xml|xdg-shell"
+      "unstable/xdg-decoration/xdg-decoration-unstable-v1.xml|xdg-decoration-unstable-v1"
+      "staging/cursor-shape/cursor-shape-v1.xml|cursor-shape-v1"
+      "stable/tablet/tablet-v2.xml|tablet-v2")
+    string(REPLACE "|" ";" _parts ${_spec})
+    list(GET _parts 0 _xml)
+    list(GET _parts 1 _name)
+    add_custom_command(
+      OUTPUT ${_proto_dir}/${_name}-client-protocol.h ${_proto_dir}/${_name}-protocol.c
+      COMMAND ${WAYLAND_SCANNER} client-header ${WAYLAND_PROTOCOLS}/${_xml} ${_proto_dir}/${_name}-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER} private-code ${WAYLAND_PROTOCOLS}/${_xml} ${_proto_dir}/${_name}-protocol.c
+      DEPENDS ${WAYLAND_PROTOCOLS}/${_xml})
+    list(APPEND _proto_srcs ${_proto_dir}/${_name}-client-protocol.h ${_proto_dir}/${_name}-protocol.c)
+  endforeach()
+  enable_language(C)
+  add_library(verso_protocols STATIC ${_proto_srcs})
+  set_target_properties(verso_protocols PROPERTIES LINKER_LANGUAGE C)
+  target_include_directories(verso_protocols PUBLIC ${_proto_dir})
+  target_link_libraries(verso_protocols PUBLIC PkgConfig::VERSO_LINUX)
+
+  # The bundled fonts become part of the program, as the .rc resources do on Windows.
+  set(_font_cpp ${CMAKE_BINARY_DIR}/generated/EmbeddedFonts.cpp)
+  file(GLOB _font_files ${CMAKE_SOURCE_DIR}/res/fonts/*.ttf)
+  set(_font_body "#include <cstddef>\n#include <cstdint>\nnamespace verso::linux_fonts {\n")
+  set(_font_index "")
+  set(_n 0)
+  foreach(_f ${_font_files})
+    file(READ ${_f} _hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _hex "${_hex}")
+    string(APPEND _font_body "static const uint8_t f${_n}[] = {${_hex}};\n")
+    file(SIZE ${_f} _size)
+    string(APPEND _font_index "{f${_n}, ${_size}},")
+    math(EXPR _n "${_n} + 1")
+  endforeach()
+  file(READ ${CMAKE_SOURCE_DIR}/res/fonts/OFL.txt _ofl HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _ofl "${_ofl}")
+  string(APPEND _font_body "struct Blob { const uint8_t* data; size_t size; };\n"
+    "extern const Blob kFonts[] = {${_font_index}};\nextern const size_t kFontCount = ${_n};\n"
+    "static const uint8_t ofl[] = {${_ofl}0x00};\nextern const char* const kOflText = reinterpret_cast<const char*>(ofl);\n}\n")
+  file(WRITE ${_font_cpp}.in "${_font_body}")
+  configure_file(${_font_cpp}.in ${_font_cpp} COPYONLY)
+
+  add_library(verso_git STATIC
+    merge/src/git_process.cpp
+    merge/src/git.cpp
+    merge/src/graph.cpp
+    merge/src/util.cpp
+  )
+  target_include_directories(verso_git BEFORE PRIVATE src/app/linux/win32)
+  target_include_directories(verso_git PUBLIC merge/src src)
+  target_link_libraries(verso_git PUBLIC verso_core Threads::Threads)
+
+  add_executable(verso
+    src/app/linux/main.cpp
+    src/app/linux/AppLinux.cpp
+    src/app/linux/Window.cpp
+    src/app/linux/Win32Compat.cpp
+    src/app/linux/GfxCairo.cpp
+    src/app/linux/Menus.cpp
+    src/app/linux/Clipboard.cpp
+    src/app/linux/Pty.cpp
+    src/app/linux/GitView.cpp
+    src/app/linux/GitWidgets.cpp
+    src/app/App.cpp
+    src/app/AppCommands.cpp
+    src/app/AppFiles.cpp
+    src/app/AppGit.cpp
+    src/app/AppInput.cpp
+    src/app/AppMarkdown.cpp
+    src/app/AppMcp.cpp
+    src/app/AppPdf.cpp
+    src/app/AppPanels.cpp
+    src/app/AppRender.cpp
+    src/app/AppTerminal.cpp
+    src/app/FileTree.cpp
+    src/app/GitService.cpp
+    src/app/Icons.cpp
+    src/app/Keymap.cpp
+    src/app/LineEdit.cpp
+    src/app/MarkdownImages.cpp
+    src/app/MarkdownLinks.cpp
+    src/app/MarkdownPreview.cpp
+    src/app/McpServer.cpp
+    src/app/PdfView.cpp
+    src/app/Settings.cpp
+    ${_font_cpp}
+  )
+  # src/app/linux/win32 holds the stand-ins for <windows.h> and friends (Win32Compat.h).
+  target_include_directories(verso BEFORE PRIVATE src/app/linux/win32)
+  target_include_directories(verso PRIVATE src ${CMAKE_BINARY_DIR}/generated)
+  target_compile_options(verso PRIVATE -Wall -Wno-unused-parameter -Wno-missing-field-initializers)
+  target_link_libraries(verso PRIVATE verso_core verso_git verso_protocols PkgConfig::VERSO_LINUX Threads::Threads util)
+
+  # verso-mcp: connects MCP clients (AI tools) to a running Verso over a Unix socket.
+  add_executable(verso-mcp src/mcp/verso_mcp.cpp)
+  add_dependencies(verso verso-mcp)
+
+  include(GNUInstallDirs)
+  install(TARGETS verso verso-mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES res/linux/verso.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+  foreach(_size 16 32 48 64 128 256 512)
+    install(FILES res/icons/verso-${_size}.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/${_size}x${_size}/apps
+            RENAME verso.png)
+  endforeach()
+  install(FILES README.md LICENSE NOTICE res/fonts/OFL.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/verso)
 else()
   message(STATUS "Verso ${VERSO_VERSION}: building the portable core and its tests. "
-                 "The application front end is Windows-only for now (README > Platforms).")
+                 "The application front end runs on Windows and Linux (README > Platforms).")
 endif()
 
 set(CPACK_PACKAGE_NAME Verso)

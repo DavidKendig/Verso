@@ -1,30 +1,102 @@
 #include "app/App.h"
 
+#ifdef _WIN32
 #include <dwmapi.h>
 #include <imm.h>
 #include <shellapi.h>
 #include <windowsx.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
 
+#ifdef _WIN32
 #include "app/DarkMenu.h"
+#else
+#include "app/linux/Window.h"
+#endif
 #include "merge_view.h"
 
 namespace verso {
 
 namespace {
 
+#ifdef _WIN32
 constexpr wchar_t kClassName[] = L"VersoMainWindow";
+#endif
 constexpr UINT_PTR kTimerBlink = 1;
 constexpr UINT_PTR kTimerSession = 3;
 
 }  // namespace
 
+#ifdef _WIN32  // Linux: linux/AppLinux.cpp (its window and UI state are complete there)
 App::App() = default;
 
 App::~App() { index_.stop(); }
+#endif
 
+// Results posted by background work (git status, the file index, PDF pages, Markdown
+// images, the terminal and AI tools). Returns false for other messages.
+bool App::onAppMessage(UINT msg, WPARAM wp) {
+  switch (msg) {
+    case WM_APP_GIT_READY:
+      onGitResults();
+      return true;
+    case WM_APP_TERMINAL:
+      onTerminalMessage(wp);
+      return true;
+    case WM_APP_MCP:
+      mcp_.runPending([this](const std::string& tool, const json::Value& args) { return mcpCall(tool, args); });
+      return true;
+    case WM_APP_PDF_READY:
+      onPdfReady();
+      return true;
+    case WM_APP_MD_IMAGES:
+      if (preview_.images().takeResults()) invalidate();
+      return true;
+    case WM_APP_INDEX_READY:
+      indexSnapshot_ = index_.snapshot();
+      if (overlay_ == Overlay::Files) refreshOverlay();
+      invalidate();
+      return true;
+    default:
+      return false;
+  }
+}
+
+void App::onMenuCommand(UINT id) {
+  if (id >= 50000 && id < 50100) {
+    size_t i = id - 50000;
+    if (i < recentFiles_.size()) openFile(recentFiles_[i]);
+    return;
+  }
+  if (id >= 51000 && id < 51100) {
+    size_t i = id - 51000;
+    if (i < recentFolders_.size()) openFolder(recentFolders_[i], true);
+    return;
+  }
+  auto it = menuCommands_.find(id);
+  if (it != menuCommands_.end()) runCommand(it->second);
+}
+
+App::CursorKind App::cursorAt(float x, float y) {
+  if (overlay_ != Overlay::None) return overlayInputRect().contains(x, y) ? CursorKind::IBeam : CursorKind::Arrow;
+  if (drag_ == Drag::Splitter || (!lay_.splitter.empty() && lay_.splitter.contains(x, y))) return CursorKind::SizeWE;
+  if (!lay_.preview.empty() && lay_.preview.contains(x, y)) {
+    if (Document* pd = doc(); pd && !preview_.linkAt(x, y, lay_.preview, pd->previewScroll).url.empty())
+      return CursorKind::Hand;
+    return CursorKind::Arrow;
+  }
+  if (lay_.text.contains(x, y) && doc()) return CursorKind::IBeam;
+  if (findMode_ != FindMode::Hidden && lay_.find.contains(x, y)) {
+    FindLayout fl = findLayout();
+    if (fl.findBox.contains(x, y) || (findMode_ == FindMode::Replace && fl.replaceBox.contains(x, y)))
+      return CursorKind::IBeam;
+  }
+  return CursorKind::Arrow;
+}
+
+#ifdef _WIN32
 int App::run(HINSTANCE instance, int show, const std::vector<std::wstring>& args) {
   inst_ = instance;
   bool newWindow = false;
@@ -242,21 +314,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hwnd_, &pt);
-        float x = gfx_.pxToDip(pt.x), y = gfx_.pxToDip(pt.y);
         LPCWSTR cursor = IDC_ARROW;
-        if (overlay_ != Overlay::None) {
-          if (overlayInputRect().contains(x, y)) cursor = IDC_IBEAM;
-        } else if (drag_ == Drag::Splitter || (!lay_.splitter.empty() && lay_.splitter.contains(x, y))) {
-          cursor = IDC_SIZEWE;
-        } else if (!lay_.preview.empty() && lay_.preview.contains(x, y)) {
-          if (Document* pd = doc(); pd && !preview_.linkAt(x, y, lay_.preview, pd->previewScroll).url.empty())
-            cursor = IDC_HAND;
-        } else if (lay_.text.contains(x, y) && doc()) {
-          cursor = IDC_IBEAM;
-        } else if (findMode_ != FindMode::Hidden && lay_.find.contains(x, y)) {
-          FindLayout fl = findLayout();
-          if (fl.findBox.contains(x, y) || (findMode_ == FindMode::Replace && fl.replaceBox.contains(x, y)))
-            cursor = IDC_IBEAM;
+        switch (cursorAt(gfx_.pxToDip(pt.x), gfx_.pxToDip(pt.y))) {
+          case CursorKind::IBeam: cursor = IDC_IBEAM; break;
+          case CursorKind::SizeWE: cursor = IDC_SIZEWE; break;
+          case CursorKind::Hand: cursor = IDC_HAND; break;
+          default: break;
         }
         SetCursor(LoadCursorW(nullptr, cursor));
         return TRUE;
@@ -270,19 +333,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         merge_->onMenuCommand(wp, lp);
         return 0;
       }
-      UINT id = LOWORD(wp);
-      if (id >= 50000 && id < 50100) {
-        size_t i = id - 50000;
-        if (i < recentFiles_.size()) openFile(recentFiles_[i]);
-        return 0;
-      }
-      if (id >= 51000 && id < 51100) {
-        size_t i = id - 51000;
-        if (i < recentFolders_.size()) openFolder(recentFolders_[i], true);
-        return 0;
-      }
-      auto it = menuCommands_.find(id);
-      if (it != menuCommands_.end()) runCommand(it->second);
+      onMenuCommand(LOWORD(wp));
       return 0;
     }
     case WM_INITMENUPOPUP:
@@ -332,19 +383,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
       updateImePosition();
       break;
     case WM_APP_GIT_READY:
-      onGitResults();
-      return 0;
     case WM_APP_TERMINAL:
-      onTerminalMessage(wp);
-      return 0;
     case WM_APP_MCP:
-      mcp_.runPending([this](const std::string& tool, const json::Value& args) { return mcpCall(tool, args); });
-      return 0;
     case WM_APP_PDF_READY:
-      onPdfReady();
-      return 0;
     case WM_APP_MD_IMAGES:
-      if (preview_.images().takeResults()) invalidate();
+    case WM_APP_INDEX_READY:
+      onAppMessage(msg, wp);
       return 0;
     case WM_XBUTTONDOWN:
       // Mouse back/forward buttons follow the Markdown link history.
@@ -353,11 +397,6 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
       }
       break;
-    case WM_APP_INDEX_READY:
-      indexSnapshot_ = index_.snapshot();
-      if (overlay_ == Overlay::Files) refreshOverlay();
-      invalidate();
-      return 0;
     case WM_CLOSE:
       requestClose();
       return 0;
@@ -379,6 +418,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
   }
   return DefWindowProcW(hwnd_, msg, wp, lp);
 }
+#endif  // _WIN32
 
 void App::invalidate() {
   if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -512,6 +552,7 @@ void App::setStatus(std::wstring msg, int ms) {
   invalidate();
 }
 
+#ifdef _WIN32
 void App::setFullscreen(bool on) {
   if (on == fullscreen_) return;
   fullscreen_ = on;
@@ -533,6 +574,7 @@ void App::setFullscreen(bool on) {
   computeLayout();
   invalidate();
 }
+#endif
 
 void App::toggleFullscreen() {
   if (distractionFree_) {
@@ -594,10 +636,15 @@ void App::requestClose() {
     }
   }
   saveSession();
+#ifdef _WIN32
   SetMenu(hwnd_, nullptr);  // menus are owned by the editor and the git view, not the window
   DestroyWindow(hwnd_);
+#else
+  window_->quit();
+#endif
 }
 
+#ifdef _WIN32
 void App::applyDarkTitleBar() {
   BOOL dark = theme_.dark ? TRUE : FALSE;
   DwmSetWindowAttribute(hwnd_, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
@@ -630,5 +677,6 @@ void App::updateImePosition() {
     ImmReleaseContext(hwnd_, imc);
   }
 }
+#endif  // _WIN32
 
 }  // namespace verso

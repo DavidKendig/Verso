@@ -11,9 +11,43 @@
 #include "app/Gfx.h"
 #include "app/Theme.h"
 
+#ifndef _WIN32
+typedef struct _cairo_surface cairo_surface_t;
+#endif
+
 namespace verso {
 
 inline constexpr UINT WM_APP_PDF_READY = WM_APP + 3;
+
+#ifndef _WIN32
+// Owns one cairo image surface: the Linux stand-in for a page's ID2D1Bitmap.
+class SurfaceRef {
+ public:
+  SurfaceRef() = default;
+  SurfaceRef(SurfaceRef&& o) noexcept : s_(o.s_) { o.s_ = nullptr; }
+  SurfaceRef& operator=(SurfaceRef&& o) noexcept {
+    if (this != &o) {
+      Reset();
+      s_ = o.s_;
+      o.s_ = nullptr;
+    }
+    return *this;
+  }
+  SurfaceRef(const SurfaceRef&) = delete;
+  SurfaceRef& operator=(const SurfaceRef&) = delete;
+  ~SurfaceRef() { Reset(); }
+  void Reset();
+  void Attach(cairo_surface_t* s) {
+    Reset();
+    s_ = s;
+  }
+  cairo_surface_t* Get() const { return s_; }
+  explicit operator bool() const { return s_ != nullptr; }
+
+ private:
+  cairo_surface_t* s_ = nullptr;
+};
+#endif
 
 // True when bytes start with a PDF file header ("%PDF-"). Readers also accept the
 // header a little later, but text that merely mentions "%PDF-" must stay text.
@@ -55,7 +89,11 @@ class PdfView {
   struct Page {
     float w = 612, h = 792;  // page size in DIPs (aspect corrected after rendering)
     float top = 0;           // document y of the page (layout)
+#ifdef _WIN32
     ComPtr<ID2D1Bitmap> bitmap;
+#else
+    SurfaceRef bitmap;
+#endif
     int bitmapW = 0;  // pixel width of `bitmap`, or of `pixels` awaiting upload
     int pixelsH = 0;
     std::vector<uint8_t> pixels;  // BGRA (premultiplied) from the worker

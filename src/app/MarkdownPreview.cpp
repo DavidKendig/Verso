@@ -53,8 +53,9 @@ bool isLocalNoteLink(const std::wstring& url) {
   return path.size() > 3 && _wcsicmp(path.c_str() + path.size() - 3, L".md") == 0;
 }
 
+#ifdef _WIN32
 // An image placed in a DirectWrite layout. Direct2D calls Draw() while drawing the
-// layout, at the object's top-left corner.
+// layout, at the object's top-left corner. (Linux: IDWriteTextLayout::SetInlineImage.)
 class ImageObject final : public IDWriteInlineObject {
  public:
   ImageObject(MarkdownImages* images, std::wstring key, float w, float h)
@@ -103,6 +104,7 @@ class ImageObject final : public IDWriteInlineObject {
   std::wstring key_;
   float w_, h_;
 };
+#endif
 
 }  // namespace
 
@@ -193,9 +195,15 @@ MarkdownPreview::TextBlock MarkdownPreview::makeText(Gfx& g, const Theme& theme,
           h *= maxW / w;
           w = maxW;
         }
+#ifdef _WIN32
         auto* obj = new ImageObject(&images_, info.key, std::max(1.0f, w), std::max(1.0f, h));
         l->SetInlineObject(obj, r);
         obj->Release();
+#else
+        l->SetInlineImage([images = &images_, key = info.key](float x, float y, float iw,
+                                                              float ih) { images->draw(key, {x, y, x + iw, y + ih}); },
+                          std::max(1.0f, w), std::max(1.0f, h), r);
+#endif
         if (h > lineH * 0.8f) tallImage = true;
         continue;
       }
